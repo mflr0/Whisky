@@ -1,0 +1,88 @@
+name: Package WhiskyWine
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - WhiskyWineVersion.plist
+      - DXVK/**
+      - .github/workflows/package-wine.yml
+  workflow_dispatch:
+
+env:
+  GPTK_VERSION: "3.0-3"
+  GPTK_URL: "https://github.com/Gcenx/game-porting-toolkit/releases/download/Game-Porting-Toolkit-3.0-3/game-porting-toolkit-3.0-3.tar.xz"
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download GPTK
+        run: |
+          curl -L -o gptk.tar.xz "${{ env.GPTK_URL }}"
+          mkdir -p gptk_extract
+          tar -xf gptk.tar.xz -C gptk_extract
+
+      - name: Create Libraries from GPTK
+        run: |
+          WINE_SRC="gptk_extract/Game Porting Toolkit.app/Contents/Resources/wine"
+
+          mkdir -p Libraries/Wine
+          ditto "$WINE_SRC/bin"   Libraries/Wine/bin
+          ditto "$WINE_SRC/lib"   Libraries/Wine/lib
+          ditto "$WINE_SRC/share" Libraries/Wine/share
+
+          # Remove man pages
+          rm -rf Libraries/Wine/share/man
+
+      - name: Add DXVK
+        run: |
+          cp -a DXVK Libraries/
+
+      - name: Add winetricks
+        run: |
+          curl -L -o Libraries/winetricks \
+            https://raw.githubusercontent.com/Winetricks/winetricks/master/src/winetricks
+          chmod +x Libraries/winetricks
+          curl -L -o Libraries/verbs.txt \
+            https://raw.githubusercontent.com/Winetricks/winetricks/master/files/verbs/all.txt
+
+      - name: Add version plist
+        run: |
+          cp -a WhiskyWineVersion.plist Libraries/
+
+      - name: Build checksum
+        run: |
+          find ./Libraries -type f -exec shasum "{}" + > SUMS.sha
+
+      - name: Tar Libraries
+        run: |
+          tar -zcf Libraries.tar.gz Libraries
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Libraries
+          path: Libraries.tar.gz
+
+      - name: Read WhiskyWine version
+        id: version
+        run: |
+          VERSION=$(/usr/libexec/PlistBuddy -c "Print :version:major" WhiskyWineVersion.plist).$(/usr/libexec/PlistBuddy -c "Print :version:minor" WhiskyWineVersion.plist).$(/usr/libexec/PlistBuddy -c "Print :version:patch" WhiskyWineVersion.plist)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: wine-v${{ steps.version.outputs.version }}
+          name: WhiskyWine ${{ steps.version.outputs.version }}
+          files: |
+            Libraries.tar.gz
+            WhiskyWineVersion.plist
+            SUMS.sha
+          make_latest: true
