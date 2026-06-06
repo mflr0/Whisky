@@ -1,4 +1,4 @@
-name: Package WhiskyWine
+name: Build WhiskyWine
 
 on:
   push:
@@ -6,39 +6,123 @@ on:
     paths:
       - WhiskyWineVersion.plist
       - DXVK/**
+      - patches/**
       - .github/workflows/package-wine.yml
   workflow_dispatch:
 
 env:
-  GPTK_VERSION: "3.0-3"
+  WINE_VERSION: "11.0"
   GPTK_URL: "https://github.com/Gcenx/game-porting-toolkit/releases/download/Game-Porting-Toolkit-3.0-3/game-porting-toolkit-3.0-3.tar.xz"
+  MACOSX_DEPLOYMENT_TARGET: "14.0"
+  CFLAGS: "-O3 -Wno-implicit-function-declaration -Wno-format -Wno-deprecated-declarations -Wno-incompatible-pointer-types"
+  CROSSCFLAGS: "-O3 -Wno-error=incompatible-pointer-types -Wno-error=int-conversion"
+  LDFLAGS: "-Wl,-headerpad_max_install_names -Wl,-rpath,@loader_path/../lib -Wl,-rpath,@loader_path/../lib/external"
 
 permissions:
   contents: write
 
 jobs:
-  package:
-    runs-on: macos-latest
+  build:
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download GPTK
+      - name: Download Wine sources
+        run: |
+          curl -L -o wine.tar.xz "https://dl.winehq.org/wine/source/11.0/wine-${{ env.WINE_VERSION }}.tar.xz"
+          mkdir -p wine-src
+          tar -xf wine.tar.xz -C wine-src --strip-components=1
+
+      - name: Apply D3DMetal patch
+        run: |
+          cd wine-src
+          patch -p1 < ../patches/d3dmetal-wine11.patch
+
+      - name: Download GPTK (for D3DMetal)
         run: |
           curl -L -o gptk.tar.xz "${{ env.GPTK_URL }}"
           mkdir -p gptk_extract
           tar -xf gptk.tar.xz -C gptk_extract
 
-      - name: Create Libraries from GPTK
+      - name: Install build dependencies
         run: |
-          WINE_SRC="gptk_extract/Game Porting Toolkit.app/Contents/Resources/wine"
+          brew update
+          brew install bison pkg-config mingw-w64 \
+            freetype gettext gnutls gstreamer sdl2 molten-vk winetricks
 
+      - name: Add bison to PATH
+        run: echo "$(brew --prefix bison)/bin" >> $GITHUB_PATH
+
+      - name: Configure Wine
+        run: |
+          set -x
+          export ac_cv_lib_soname_MoltenVK="libMoltenVK.dylib"
+          export ac_cv_lib_soname_vulkan=""
+
+          mkdir -p build
+          cd build
+          ../wine-src/configure \
+            --prefix= \
+            --enable-archs=i386,x86_64 \
+            --disable-tests \
+            --disable-winedbg \
+            --without-alsa \
+            --without-capi \
+            --with-coreaudio \
+            --with-cups \
+            --without-dbus \
+            --without-fontconfig \
+            --with-freetype \
+            --with-gettext \
+            --without-gettextpo \
+            --without-gphoto \
+            --with-gnutls \
+            --without-gssapi \
+            --with-gstreamer \
+            --without-inotify \
+            --without-krb5 \
+            --with-mingw \
+            --without-netapi \
+            --with-opencl \
+            --with-opengl \
+            --without-oss \
+            --with-pcap \
+            --with-pthread \
+            --without-pulse \
+            --without-sane \
+            --with-sdl \
+            --without-udev \
+            --with-unwind \
+            --without-usb \
+            --without-v4l2 \
+            --with-vulkan \
+            --without-x
+
+      - name: Build Wine
+        run: |
+          cd build
+          make -j$(sysctl -n hw.ncpu)
+
+      - name: Install Wine
+        run: |
+          cd build
+          make install-lib DESTDIR="$GITHUB_WORKSPACE/install"
+
+      - name: Create Libraries package
+        run: |
           mkdir -p Libraries/Wine
-          ditto "$WINE_SRC/bin"   Libraries/Wine/bin
-          ditto "$WINE_SRC/lib"   Libraries/Wine/lib
-          ditto "$WINE_SRC/share" Libraries/Wine/share
-
-          # Remove man pages
+          cp -a install/. Libraries/Wine/
           rm -rf Libraries/Wine/share/man
+
+          # Compat symlink: Whisky expects wine64, Wine 11 builds wine
+          if [ -f Libraries/Wine/bin/wine ] && [ ! -f Libraries/Wine/bin/wine64 ]; then
+            ln -s wine Libraries/Wine/bin/wine64
+          fi
+
+      - name: Install D3DMetal from GPTK
+        run: |
+          GPTK_LIB="gptk_extract/Game Porting Toolkit.app/Contents/Resources/wine/lib/external"
+          ditto "$GPTK_LIB" Libraries/Wine/lib/external
 
       - name: Add DXVK
         run: |
@@ -63,6 +147,13 @@ jobs:
       - name: Tar Libraries
         run: |
           tar -zcf Libraries.tar.gz Libraries
+
+      - name: Upload config.log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: config-log
+          path: build/config.log
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
